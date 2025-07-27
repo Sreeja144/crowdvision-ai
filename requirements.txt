@@ -12,5 +12,5 @@ onnxruntime
 protobuf
 scikit-learn
 psycopg2-binary
-python-3.10.13
+#python-3.10.13
 
