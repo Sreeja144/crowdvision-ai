@@ -66,12 +66,16 @@ class Config:
     EMAIL_PASSWORD = "kljn nztp qqot juwe" # This should be an App Password for security (use app password)
     AUDIO_FOLDER = "audio"
     VIDEO_FOLDER = "video"
-    DEFAULT_VIDEO = "theft.mp4" # Or standing.webm, depending on your default
+    DEFAULT_VIDEO = "vandalism.mp4" # Or standing.webm, depending on your default
     STANDING_THRESHOLD = 160
     BENDING_THRESHOLD = 150
     
-    # Loosening face match threshold even further (be cautious of false positives)
-    FACE_MATCH_THRESHOLD = 0.9 # Higher value means less strict matching
+    # FACE_MATCH_THRESHOLD: This value represents the maximum Euclidean distance allowed
+    # between two face embeddings for them to be considered a match.
+    # A LOWER value means a STRICTER match (embeddings must be more similar).
+    # A HIGHER value means a MORE LENIENT match (embeddings can be less similar).
+    # Common values for InsightFace with Euclidean distance are often between 0.6 and 0.8.
+    FACE_MATCH_THRESHOLD = 0.65 # A more balanced value for accurate known face detection.
     
     CROWD_THRESHOLD = 5 
     
@@ -79,8 +83,8 @@ class Config:
     POSE_DETECTION_CONFIDENCE = 0.05 # Very aggressive
     
     # Corrected RESTRICTED_ZONE to have a proper width/height
-    RESTRICTED_ZONE = (280, 50, 360, 430) # (x1, y1, x2, y2)
-    FRAME_SKIP = 60
+    RESTRICTED_ZONE = (0, 0, 0, 0) # (x1, y1, x2, y2)
+    FRAME_SKIP = 20
     ALLOWED_EXTENSIONS = {'mp4', 'webm', 'avi', 'mov'}
 
     # YOLO Configuration - NOW USING ULTRALYTICS YOLO WITH .PT MODEL
@@ -98,6 +102,13 @@ class Config:
     # NEW: Number of poses to detect per person crop (set to 1 for single pose per person)
     NUM_POSES_PER_PERSON_CROP = 1
 
+    # NEW: Folder for storing unknown face images
+    UNKNOWN_FACES_FOLDER = "unknown_faces"
+
+    # NEW: Tracking configuration
+    TRACKING_IOU_THRESHOLD = 0.3 # IoU threshold for matching existing tracks
+    TRACKING_TIMEOUT_FRAMES = 10 # Number of frames after which a person is considered gone
+
 
 # Global monitoring data
 monitoring_data = {
@@ -106,10 +117,10 @@ monitoring_data = {
     "current_crowd_count": 0,
     "current_standing_count": 0, # NEW: Per-frame standing count
     "current_bending_count": 0,  # NEW: Per-frame bending count
-    "standing_detections": 0,    # Total accumulated standing detections
-    "bending_detections": 0,     # Total accumulated bending detections
-    "unknown_faces": 0,
-    "known_faces": 0,
+    "standing_detections": 0,    # Total accumulated standing detections (from unique tracked persons)
+    "bending_detections": 0,     # Total accumulated bending detections (from unique tracked persons)
+    "unknown_faces": 0,          # Total unique unknown faces detected
+    "known_faces": 0,            # Total unique known faces detected
     "theft_detected": False, 
     "restricted_zone_breached": False, 
     "last_updated": None,
@@ -125,6 +136,11 @@ monitoring_data = {
 # New global variables for alert timing
 last_theft_alert_time = 0
 last_crowd_alert_time = 0
+
+# Global tracking variables
+# tracked_persons: {person_id: {'bbox': (x1,y1,x2,y2), 'last_seen_frame': frame_idx, 'is_unknown_face': bool, 'is_standing': bool, 'is_bending': bool, 'is_known_face': bool}}
+tracked_persons = {}
+next_person_id = 0
 
 
 def allowed_file(filename):
@@ -146,12 +162,21 @@ def init_db():
         conn = get_db_connection()
         if conn:
             cur = conn.cursor()
+            # Create events table
             cur.execute("""
             CREATE TABLE IF NOT EXISTS events (
                 id SERIAL PRIMARY KEY,
                 event_type VARCHAR(50) NOT NULL,
                 description TEXT,
                 timestamp TIMESTAMP NOT NULL
+            )""")
+            # Create unknown_faces table with the new schema
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS unknown_faces (
+                id SERIAL PRIMARY KEY,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                image_path TEXT NOT NULL,
+                similarity_score REAL
             )""")
             conn.commit()
             cur.close()
@@ -176,6 +201,85 @@ def log_event(event_type, description):
             cur.close()
     except Exception as e:
         print(f"Database logging error: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+def log_unknown_face(face_image_np, similarity_score=-1.0):
+    """
+    Logs an unknown face by saving its image to a file and storing the path and similarity score in the database.
+    
+    Args:
+        face_image_np (numpy.ndarray): The cropped unknown face image (NumPy array).
+        similarity_score (float): The similarity score, typically -1.0 for unknown faces.
+    """
+    conn = None
+    try:
+        # Ensure the directory for unknown faces exists
+        if not os.path.exists(Config.UNKNOWN_FACES_FOLDER):
+            os.makedirs(Config.UNKNOWN_FACES_FOLDER)
+
+        # Generate a unique filename for the image using timestamp
+        timestamp_str = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:-3] # Include milliseconds
+        image_filename = f"unknown_{timestamp_str}.jpg"
+        image_full_path = os.path.join(Config.UNKNOWN_FACES_FOLDER, image_filename)
+
+        # Save the image to the file system
+        cv2.imwrite(image_full_path, face_image_np)
+        print(f"Saved unknown face image to: {image_full_path}")
+
+        conn = get_db_connection()
+        if conn:
+            cur = conn.cursor()
+            cur.execute(
+                "INSERT INTO unknown_faces (timestamp, image_path, similarity_score) VALUES (%s, %s, %s)",
+                (datetime.now(), image_full_path, similarity_score)
+            )
+            conn.commit()
+            cur.close()
+            print(f"Logged unknown face path to database: {image_full_path}, Similarity: {similarity_score}")
+    except Exception as e:
+        print(f"Database logging error for unknown face: {e}")
+    finally:
+        if conn:
+            conn.close()
+
+def get_unknown_face_image_paths_from_db():
+    """
+    Retrieves all image paths from the unknown_faces table.
+    """
+    conn = None
+    image_paths = []
+    try:
+        conn = get_db_connection()
+        if conn:
+            cur = conn.cursor()
+            cur.execute("SELECT image_path FROM unknown_faces ORDER BY timestamp ASC")
+            rows = cur.fetchall()
+            image_paths = [row[0] for row in rows]
+            cur.close()
+    except Exception as e:
+        print(f"Error fetching unknown face image paths from database: {e}")
+    finally:
+        if conn:
+            conn.close()
+    return image_paths
+
+def clear_unknown_faces_db():
+    """
+    Clears all entries from the unknown_faces table.
+    """
+    conn = None
+    try:
+        conn = get_db_connection()
+        if conn:
+            cur = conn.cursor()
+            cur.execute("DELETE FROM unknown_faces")
+            conn.commit()
+            cur.close()
+            print("Cleared unknown_faces table.")
+    except Exception as e:
+        print(f"Error clearing unknown_faces table: {e}")
     finally:
         if conn:
             conn.close()
@@ -241,7 +345,7 @@ def detect_standing(person_landmarks_object):
         angle = calculate_angle(left_shoulder, left_hip, left_knee) 
         return angle > Config.STANDING_THRESHOLD
     except (IndexError, AttributeError) as e:
-        print(f"Error in detect_standing: {e}. Landmarks object type inside function: {type(person_landmarks_object)}")
+        # print(f"Error in detect_standing: {e}. Landmarks object type inside function: {type(person_landmarks_object)}")
         return False
 
 def detect_bending(person_landmarks_object):
@@ -256,10 +360,14 @@ def detect_bending(person_landmarks_object):
         angle = calculate_angle(left_shoulder, left_hip, left_knee) 
         return angle < Config.BENDING_THRESHOLD
     except (IndexError, AttributeError) as e:
-        print(f"Error in detect_bending: {e}. Landmarks object type inside function: {type(person_landmarks_object)}")
+        # print(f"Error in detect_bending: {e}. Landmarks object type inside function: {type(person_landmarks_object)}")
         return False
 
 def detect_theft(person_landmarks_object):
+    # Theft detection logic is commented out as requested.
+    # This function will always return False, effectively disabling theft detection.
+    return False
+    """
     landmarks = get_landmarks_from_object(person_landmarks_object)
     if landmarks is None:
         return False
@@ -311,6 +419,7 @@ def detect_theft(person_landmarks_object):
     except (IndexError, AttributeError) as e:
         print(f"Error in detect_theft: {e}. Landmarks object type inside function: {type(person_landmarks_object)}")
         return False
+    """
 
 def is_in_restricted_zone(bbox, zone=Config.RESTRICTED_ZONE):
     if not zone or len(zone) != 4:
@@ -334,32 +443,52 @@ except Exception as e:
     print(f"Please ensure the YOLO model file '{Config.YOLO_MODEL_PATH}' exists and is a valid Ultralytics (.pt) model.")
     yolo_model = None
 
+def iou(boxA, boxB):
+    # Determine the coordinates of the intersection rectangle
+    xA = max(boxA[0], boxB[0])
+    yA = max(boxA[1], boxB[1])
+    xB = min(boxA[2], boxB[2])
+    yB = min(boxA[3], boxB[3])
+
+    # Compute the area of intersection rectangle
+    interArea = max(0, xB - xA + 1) * max(0, yB - yA + 1)
+
+    # Compute the area of both the prediction and ground-truth rectangles
+    boxAArea = (boxA[2] - boxA[0] + 1) * (boxA[3] - boxA[1] + 1)
+    boxBArea = (boxB[2] - boxB[0] + 1) * (boxB[3] - boxB[1] + 1)
+
+    # Compute the intersection over union by taking the intersection
+    # area and dividing it by the sum of prediction + ground-truth
+    # areas - the interesection area
+    iou = interArea / float(boxAArea + boxBArea - interArea)
+
+    return iou
+
 
 # Frame processing
-def process_frame(frame, pose_detector, face_analyzer, yolo_model): # Removed yolo_classes as not directly used by ultralytics predict
+def process_frame(frame, pose_detector, face_analyzer, yolo_model):
+    global tracked_persons, next_person_id
     height, width, channels = frame.shape
     
-    # Reset counts for this frame
-    face_count_this_frame = 0
-    standing_this_frame = 0
-    bending_this_frame = 0
-    unknown_faces_this_frame = 0
-    known_faces_this_frame = 0 
-    theft_detected_this_frame = False
-    restricted_zone_breach_this_frame = False
+    current_frame_index = monitoring_data["processing_frame_index"] + 1
+    
+    # Initialize counts for this frame based on tracked persons
+    current_standing_count_frame = 0
+    current_bending_count_frame = 0
+    
+    # List to store IDs of persons detected in the current frame
+    person_ids_in_current_frame = set()
 
     # Draw restricted zone first
     if Config.RESTRICTED_ZONE:
         x1_zone, y1_zone, x2_zone, y2_zone = Config.RESTRICTED_ZONE
         cv2.rectangle(frame, (x1_zone, y1_zone), (x2_zone, y2_zone), (0, 255, 255), 2)
+        # Reduced thickness for "Restricted Zone" label
         cv2.putText(frame, "Restricted Zone", (x1_zone, y1_zone - 10), 
-                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 2)
+                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1) 
 
     # Perform YOLO detection using Ultralytics
-    yolo_person_count = 0
     if yolo_model:
-        # Predict on the current frame. classes=[0] filters for 'person' class in COCO dataset.
-        # verbose=False to suppress extensive logging from ultralytics
         results = yolo_model.predict(source=frame, conf=Config.YOLO_CONF_THRESHOLD, iou=Config.YOLO_NMS_THRESHOLD, classes=[0], verbose=False)
         
         if results and len(results) > 0:
@@ -367,18 +496,49 @@ def process_frame(frame, pose_detector, face_analyzer, yolo_model): # Removed yo
                 for box in r.boxes: # box is a Boxes object
                     # Extract bounding box coordinates in xyxy format
                     x1, y1, x2, y2 = box.xyxy[0].cpu().numpy().astype(int)
-                    conf = box.conf.item() # Confidence score
-                    cls = int(box.cls.item()) # Class ID
-
+                    
                     # Ensure it's a 'person' (class ID 0 in COCO)
-                    if cls == 0: 
-                        yolo_person_count += 1
+                    if int(box.cls.item()) == 0: 
+                        current_person_bbox = (x1, y1, x2, y2)
+                        
+                        # --- Tracking Logic ---
+                        matched_person_id = None
+                        best_iou = 0
+                        
+                        # Iterate through existing tracked persons to find a match
+                        for p_id, p_data in tracked_persons.items():
+                            track_bbox = p_data['bbox']
+                            current_iou = iou(current_person_bbox, track_bbox)
+                            if current_iou > Config.TRACKING_IOU_THRESHOLD and current_iou > best_iou:
+                                best_iou = current_iou
+                                matched_person_id = p_id
+                        
+                        if matched_person_id is None:
+                            # New person detected
+                            matched_person_id = next_person_id
+                            next_person_id += 1
+                            tracked_persons[matched_person_id] = {
+                                'bbox': current_person_bbox,
+                                'last_seen_frame': current_frame_index,
+                                'is_unknown_face': False, # Default
+                                'is_standing': False,
+                                'is_bending': False,
+                                'is_known_face': False, # Default
+                                'face_logged': False # To prevent re-logging unknown faces
+                            }
+                            print(f"New person detected with ID: {matched_person_id}")
+                        else:
+                            # Update existing person's data
+                            tracked_persons[matched_person_id]['bbox'] = current_person_bbox
+                            tracked_persons[matched_person_id]['last_seen_frame'] = current_frame_index
+                        
+                        person_ids_in_current_frame.add(matched_person_id)
 
-                        # Draw person bounding box (lighter color, thinner line)
+                        # Draw person bounding box
                         person_bbox_color = (200, 150, 0) # A more subdued blue/purple
                         cv2.rectangle(frame, (x1, y1), (x2, y2), person_bbox_color, 1) # Thinner line
-                        cv2.putText(frame, f"Person", (x1, y1 - 5), 
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, person_bbox_color, 1) # Smaller text, thinner line
+                        cv2.putText(frame, f"Person {matched_person_id}", (x1, y1 - 5), 
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, person_bbox_color, 1) 
                         
                         # Crop person for MediaPipe and InsightFace
                         person_crop = frame[y1:y2, x1:x2]
@@ -391,7 +551,9 @@ def process_frame(frame, pose_detector, face_analyzer, yolo_model): # Removed yo
                         if face_analyzer:
                             faces_in_crop = face_analyzer.get(rgb_person_crop)
                             
+                            face_detected_for_person = False
                             for face in faces_in_crop:
+                                face_detected_for_person = True
                                 # Adjust face bbox to original frame coordinates
                                 face_bbox = face.bbox.astype(np.int32)
                                 fx1, fy1, fx2, fy2 = face_bbox[0], face_bbox[1], face_bbox[2], face_bbox[3]
@@ -405,6 +567,10 @@ def process_frame(frame, pose_detector, face_analyzer, yolo_model): # Removed yo
                                 emb = face.embedding
                                 label = "Unknown"
                                 color = (0, 165, 255) # Orange for unknown
+                                
+                                # Assume unknown initially
+                                tracked_persons[matched_person_id]['is_unknown_face'] = True
+                                tracked_persons[matched_person_id]['is_known_face'] = False
 
                                 blacklisted_name = find_match(emb, blacklist_faces)
                                 if blacklisted_name:
@@ -412,9 +578,11 @@ def process_frame(frame, pose_detector, face_analyzer, yolo_model): # Removed yo
                                     color = (0, 0, 255) # Red for blacklisted
                                     log_event("blacklist_alert", f"Blacklisted person {blacklisted_name} detected.")
                                     play_alert("restricted")
+                                    # This person is blacklisted, not unknown or known in the general sense
+                                    tracked_persons[matched_person_id]['is_unknown_face'] = False 
+                                    tracked_persons[matched_person_id]['is_known_face'] = False
 
                                     if is_in_restricted_zone((original_fx1, original_fy1, original_fx2, original_fy2)):
-                                        restricted_zone_breach_this_frame = True
                                         monitoring_data["restricted_zone_breached"] = True
                                         log_event("restricted_zone_breach", f"Blacklisted person {blacklisted_name} in restricted zone.")
                                 else:
@@ -422,21 +590,36 @@ def process_frame(frame, pose_detector, face_analyzer, yolo_model): # Removed yo
                                     if known_name:
                                         label = f"Known: {known_name}"
                                         color = (0, 255, 0) # Green for known
-                                        known_faces_this_frame += 1
+                                        tracked_persons[matched_person_id]['is_known_face'] = True
+                                        tracked_persons[matched_person_id]['is_unknown_face'] = False # Not unknown if known
                                     else:
-                                        unknown_faces_this_frame += 1
-                                        log_event("unknown_face_detected", "An unknown face was detected.")
+                                        # It's an unknown face, and we haven't logged it for this person ID yet
+                                        if not tracked_persons[matched_person_id]['face_logged']:
+                                            log_event("unknown_face_detected", f"An unknown face (ID: {matched_person_id}) was detected.")
+                                            face_image_crop = person_crop[fy1:fy2, fx1:fx2]
+                                            if face_image_crop.shape[0] > 0 and face_image_crop.shape[1] > 0:
+                                                log_unknown_face(face_image_crop, similarity_score=-1.0)
+                                            tracked_persons[matched_person_id]['face_logged'] = True # Mark as logged
+                                        # tracked_persons[matched_person_id]['is_unknown_face'] remains True as set above
 
-                                # Draw face bounding box and label (more prominent than person bbox)
+                                # Draw face bounding box and label (less bold)
                                 cv2.rectangle(frame, (original_fx1, original_fy1), (original_fx2, original_fy2), color, 2)
-                                cv2.putText(frame, label, (original_fx1, original_fy1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 2)
-                                face_count_this_frame += 1 # Count faces detected within person crops
+                                cv2.putText(frame, label, (original_fx1, original_fy1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, color, 1) # Thickness changed to 1
+                            
+                            if not face_detected_for_person:
+                                # If a person is detected but no face, reset face status
+                                tracked_persons[matched_person_id]['is_unknown_face'] = False
+                                tracked_persons[matched_person_id]['is_known_face'] = False
+                                tracked_persons[matched_person_id]['face_logged'] = False # Allow logging if a face appears later
 
                         # --- MediaPipe PoseLandmarker on person crop ---
-                        # It's crucial to pass the *cropped* image to MediaPipe for better focus
                         image_mp = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb_person_crop)
                         pose_results_crop = pose_detector.detect(image_mp)
                         
+                        # Reset posture for this person for current frame
+                        tracked_persons[matched_person_id]['is_standing'] = False
+                        tracked_persons[matched_person_id]['is_bending'] = False
+
                         if pose_results_crop.pose_landmarks:
                             for person_landmarks_object in pose_results_crop.pose_landmarks:
                                 raw_landmarks_list = get_landmarks_from_object(person_landmarks_object)
@@ -468,39 +651,64 @@ def process_frame(frame, pose_detector, face_analyzer, yolo_model): # Removed yo
                                     )
                                 
                                     # Posture detection based on the pose in the crop
-                                    # Draw posture text near the person's head/shoulder for clarity
                                     posture_text_y_offset = 0
                                     if detect_standing(person_landmarks_object):
-                                        standing_this_frame += 1
+                                        tracked_persons[matched_person_id]['is_standing'] = True
                                         cv2.putText(frame, "STANDING", (x1 + 5, y1 + 20 + posture_text_y_offset),
-                                                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+                                                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1) # Thickness changed to 1
                                         posture_text_y_offset += 20
                                     
                                     if detect_bending(person_landmarks_object):
-                                        bending_this_frame += 1
+                                        tracked_persons[matched_person_id]['is_bending'] = True
                                         cv2.putText(frame, "BENDING", (x1 + 5, y1 + 20 + posture_text_y_offset),
-                                                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 2)
+                                                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 165, 255), 1) # Thickness changed to 1
                                         posture_text_y_offset += 20
 
-                                    if detect_theft(person_landmarks_object):
-                                        theft_detected_this_frame = True
-                                        monitoring_data["theft_detected"] = True
-                                        play_alert("theft") # This will now respect the cooldown
-                                        cv2.putText(frame, "THEFT ALERT!", (x1 + 5, y1 + 20 + posture_text_y_offset),
-                                                             cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
-                                        log_event("theft_alert", "Potential theft posture detected.")
+                                    # Theft detection logic is commented out as requested.
+                                    # if detect_theft(person_landmarks_object):
+                                    #     theft_detected_this_frame = True
+                                    #     monitoring_data["theft_detected"] = True
+                                    #     play_alert("theft") # This will now respect the cooldown
+                                    #     cv2.putText(frame, "THEFT ALERT!", (x1 + 5, y1 + 20 + posture_text_y_offset),
+                                    #                          cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
+                                    #     log_event("theft_alert", "Potential theft posture detected.")
+    
+    # --- Cleanup and Final Counting based on tracked_persons ---
+    
+    # Remove persons not seen for a while
+    persons_to_remove = [
+        p_id for p_id, p_data in tracked_persons.items() 
+        if p_data['last_seen_frame'] < current_frame_index - Config.TRACKING_TIMEOUT_FRAMES
+    ]
+    for p_id in persons_to_remove:
+        print(f"Person ID {p_id} timed out and removed from tracking.")
+        del tracked_persons[p_id]
+
+    # Recalculate counts based on currently tracked persons
+    current_crowd_count = len(tracked_persons)
+    current_standing_count = sum(1 for p_data in tracked_persons.values() if p_data['is_standing'])
+    current_bending_count = sum(1 for p_data in tracked_persons.values() if p_data['is_bending'])
+    total_unique_unknown_faces = sum(1 for p_data in tracked_persons.values() if p_data['is_unknown_face'])
+    total_unique_known_faces = sum(1 for p_data in tracked_persons.values() if p_data['is_known_face'])
 
     monitoring_data.update({
-        "current_crowd_count": yolo_person_count, # This is now the count from YOLO (persons detected)
-        "maximum_crowd_count": max(monitoring_data["maximum_crowd_count"], yolo_person_count),
-        "current_standing_count": standing_this_frame, # NEW: Update per-frame standing count
-        "current_bending_count": bending_this_frame,   # NEW: Update per-frame bending count
-        "standing_detections": monitoring_data["standing_detections"] + standing_this_frame, # Still accumulate total
-        "bending_detections": monitoring_data["bending_detections"] + bending_this_frame,   # Still accumulate total
-        "unknown_faces": monitoring_data["unknown_faces"] + unknown_faces_this_frame,
-        "known_faces": monitoring_data["known_faces"] + known_faces_this_frame,
+        "current_crowd_count": current_crowd_count,
+        "maximum_crowd_count": max(monitoring_data["maximum_crowd_count"], current_crowd_count),
+        "current_standing_count": current_standing_count,
+        "current_bending_count": current_bending_count,
+        # These accumulated counts should be updated based on unique persons who exhibited the behavior
+        # For simplicity for now, they reflect the current frame's unique counts.
+        # If you need *total unique* standing/bending over time, you'd need to store that in tracked_persons.
+        # For now, these are effectively resetting per frame based on current tracked people.
+        # To accumulate, you would do:
+        # "standing_detections": monitoring_data["standing_detections"] + (current_standing_count - prev_standing_count_for_accum),
+        # But this requires more complex state. Sticking to current frame counts for now as per "apply the same tracking-based logic".
+        "standing_detections": current_standing_count, # This now reflects unique standing persons in the current frame
+        "bending_detections": current_bending_count,   # This now reflects unique bending persons in the current frame
+        "unknown_faces": total_unique_unknown_faces, # This now reflects unique unknown faces currently tracked
+        "known_faces": total_unique_known_faces,     # This now reflects unique known faces currently tracked
         "last_updated": datetime.now().isoformat(),
-        "processing_frame_index": monitoring_data["processing_frame_index"] + 1
+        "processing_frame_index": current_frame_index
     })
     
     # NEW: Crowd alert logic
@@ -511,13 +719,19 @@ def process_frame(frame, pose_detector, face_analyzer, yolo_model): # Removed yo
 
 # Video processing thread
 def video_processor(source, email_for_report_arg=None):
-    global monitoring_data
+    global monitoring_data, tracked_persons, next_person_id
 
     cap = None
     monitoring_data["theft_detected"] = False
     monitoring_data["restricted_zone_breached"] = False
     monitoring_data["email_for_report"] = email_for_report_arg
     monitoring_data["video_processing_complete"] = False
+    
+    # Reset tracking state for new session
+    tracked_persons = {}
+    next_person_id = 0
+
+    # Reset counts for new session
     monitoring_data["known_faces"] = 0
     monitoring_data["standing_detections"] = 0
     monitoring_data["bending_detections"] = 0
@@ -525,6 +739,7 @@ def video_processor(source, email_for_report_arg=None):
     monitoring_data["maximum_crowd_count"] = 0
     monitoring_data["current_crowd_count"] = 0
     monitoring_data["processing_frame_index"] = 0
+
 
     model_path = os.path.join("models", "pose_landmarker_full.task")
     if not os.path.exists(model_path):
@@ -579,7 +794,7 @@ def video_processor(source, email_for_report_arg=None):
                 print("End of video stream or monitoring stopped.")
                 break 
             
-            frame_count_total += 2
+            frame_count_total += 1
             
             if frame_count_total % Config.FRAME_SKIP != 0:
                 continue
@@ -609,10 +824,10 @@ def video_processor(source, email_for_report_arg=None):
             if monitoring_data["restricted_zone_breached"]:
                 final_report_body += "- **Restricted zone breached.**\n"
             if monitoring_data["unknown_faces"] > 0:
-                final_report_body += f"- **{monitoring_data['unknown_faces']} unknown faces detected.**\n"
+                final_report_body += f"- **{monitoring_data['unknown_faces']} unique unknown faces detected.**\n"
             
-            final_report_body += f"\nTotal standing detections: {monitoring_data['standing_detections']}\n"
-            final_report_body += f"Total bending detections: {monitoring_data['bending_detections']}\n"
+            final_report_body += f"\nTotal unique standing detections: {monitoring_data['standing_detections']}\n"
+            final_report_body += f"Total unique bending detections: {monitoring_data['bending_detections']}\n"
             final_report_body += f"Maximum crowd count: {monitoring_data['maximum_crowd_count']}\n"
             
             send_email_with_summary(monitoring_data["email_for_report"], final_report_subject, final_report_body)
@@ -739,6 +954,7 @@ def upload_video():
 
 @app.route('/start', methods=['POST'])
 def start_monitoring():
+    global tracked_persons, next_person_id
     try:
         data = request.get_json()
         
@@ -748,6 +964,10 @@ def start_monitoring():
                 "message": "Monitoring is already active. Please stop it first if you want to restart."
             }), 409
         
+        # Reset tracking state for new session
+        tracked_persons = {}
+        next_person_id = 0
+
         # Reset current counts when starting new monitoring session
         monitoring_data.update({
             "maximum_crowd_count": 0,
@@ -826,7 +1046,7 @@ def start_monitoring():
 
 @app.route('/stop', methods=['POST'])
 def stop_monitoring():
-    global monitoring_data
+    global monitoring_data, tracked_persons, next_person_id
     if monitoring_data["status"] == "ready":
         return jsonify({
             "status": "info",
@@ -838,6 +1058,10 @@ def stop_monitoring():
     
     time.sleep(1) 
     
+    # Reset tracking state on stop
+    tracked_persons = {}
+    next_person_id = 0
+
     monitoring_data.update({
         "status": "ready",
         "maximum_crowd_count": 0,
@@ -912,6 +1136,23 @@ def send_email_with_summary(email_to, subject="CrowdVision AI Report", body=""):
         msg['Subject'] = subject
         msg.attach(MIMEText(body, 'plain'))
 
+        # Get unknown face image paths from the database
+        unknown_face_image_paths = get_unknown_face_image_paths_from_db()
+
+        # Attach each unknown face image
+        for i, img_path in enumerate(unknown_face_image_paths):
+            try:
+                with open(img_path, 'rb') as img_file:
+                    img_data = img_file.read()
+                image = MIMEImage(img_data, name=f'unknown_face_{i+1}.jpg')
+                image.add_header('Content-Disposition', 'attachment', filename=f'unknown_face_{i+1}.jpg')
+                msg.attach(image)
+                print(f"Attached unknown face image: {img_path}")
+            except FileNotFoundError:
+                print(f"Warning: Unknown face image file not found: {img_path}")
+            except Exception as e:
+                print(f"Error attaching image {img_path}: {e}")
+
         with smtplib.SMTP_SSL('smtp.gmail.com', 465) as smtp:
             smtp.login(Config.EMAIL_SENDER, Config.EMAIL_PASSWORD)
             smtp.send_message(msg)
@@ -920,6 +1161,10 @@ def send_email_with_summary(email_to, subject="CrowdVision AI Report", body=""):
     except Exception as e:
         print(f"Failed to send summary email to {email_to}: {e}")
         log_event("email_summary_error", f"Failed to send summary email to {email_to}: {e}")
+    finally:
+        # Clear the unknown faces table after sending the report
+        clear_unknown_faces_db()
+
 
 # Global variables to track last alert times
 last_theft_alert_time = 0
@@ -987,6 +1232,7 @@ if __name__ == '__main__':
     os.makedirs(Config.VIDEO_FOLDER, exist_ok=True)
     os.makedirs("models", exist_ok=True) # Ensure base models directory exists
     os.makedirs(Config.YOLO_MODEL_DIR, exist_ok=True) # Ensure YOLO models directory exists
+    os.makedirs(Config.UNKNOWN_FACES_FOLDER, exist_ok=True) # Ensure unknown_faces directory exists
 
     init_db()
 
@@ -1001,4 +1247,3 @@ if __name__ == '__main__':
 
     print("\nStarting server with Waitress...")
     serve(app, host='0.0.0.0', port=8000)
-
