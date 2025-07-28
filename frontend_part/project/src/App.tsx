@@ -6,7 +6,7 @@ export default function App() {
   const [darkMode, setDarkMode] = useState(false);
   const [selectedSource, setSelectedSource] = useState('default');
   const [uploadedFile, setUploadedFile] = useState<File | null>(null);
-  const [emailForReport, setEmailForReport] = useState('');
+  const [emailForReport, setEmailForReport] = useState(''); // This email will be sent to backend on /start
   const [isMonitoring, setIsMonitoring] = useState(false);
   const [monitoringStatus, setMonitoringStatus] = useState('Ready to start monitoring.');
   const [monitoringResults, setMonitoringResults] = useState({
@@ -20,7 +20,7 @@ export default function App() {
   });
   const [errorMessage, setErrorMessage] = useState<string | null>(null);
   const [videoPreviewUrl, setVideoPreviewUrl] = useState<string | null>(null);
-  const [videoFeedKey, setVideoFeedKey] = useState(Date.now());
+  const [videoFeedKey, setVideoFeedKey] = useState(Date.now()); // Key to force re-render of img for video feed
 
   // Real-time updates when monitoring is active
   useEffect(() => {
@@ -29,29 +29,22 @@ export default function App() {
     if (isMonitoring) {
       const fetchStatus = async () => {
         try {
-          const response = await axios.get("http://localhost:8000/status");
+        
+          const response = await axios.get("https://bd8b46660df3.ngrok-free.app/status");
+
           setMonitoringResults(response.data);
-          if (response.data.video_processing_complete && response.data.status === 'completed') {
-            setIsMonitoring(false);
-            setMonitoringStatus('Video analysis completed.');
-            setVideoFeedKey(Date.now());
-          } else if (response.data.status === 'error') {
-            setErrorMessage("Backend reported an error during monitoring.");
-            setIsMonitoring(false);
-            setMonitoringStatus('Monitoring error.');
-            setVideoFeedKey(Date.now());
-          }
         } catch (error) {
           console.error("Error fetching status:", error);
+          // If status fails while monitoring, assume backend stopped or crashed
           setErrorMessage("Failed to fetch real-time status. Monitoring may have stopped.");
-          setIsMonitoring(false);
+          setIsMonitoring(false); // Stop frontend monitoring state
           setMonitoringStatus('Monitoring interrupted.');
-          setVideoFeedKey(Date.now());
+          setVideoFeedKey(Date.now()); // Refresh to clear potentially stale image
         }
       };
 
-      fetchStatus();
-      interval = setInterval(fetchStatus, 2000);
+      fetchStatus(); // Initial fetch
+      interval = setInterval(fetchStatus, 2000); // Update every 2 seconds
     }
 
     return () => clearInterval(interval);
@@ -72,7 +65,7 @@ export default function App() {
     resetMonitoringResults();
     setErrorMessage(null);
     setMonitoringStatus('Ready to start monitoring.');
-    setVideoFeedKey(Date.now());
+    setVideoFeedKey(Date.now()); // Reset video feed display
   };
 
   const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
@@ -89,7 +82,7 @@ export default function App() {
     resetMonitoringResults();
     setErrorMessage(null);
     setMonitoringStatus('Ready to start monitoring.');
-    setVideoFeedKey(Date.now());
+    setVideoFeedKey(Date.now()); // Reset video feed display
   };
 
   const resetMonitoringResults = () => {
@@ -105,32 +98,35 @@ export default function App() {
   };
 
   const handleStartMonitoring = async () => {
-    setErrorMessage(null);
-    resetMonitoringResults();
+    setErrorMessage(null); // Clear any previous errors
+    resetMonitoringResults(); // Clear previous results
     setIsMonitoring(true);
     setMonitoringStatus('Initializing video processing...');
 
     let videoPathForBackend: string | null = null;
-    let endpoint = "http://localhost:8000/start";
+    
+    let endpoint = "https://bd8b46660df3.ngrok-free.app/start";
 
     if (selectedSource === 'default') {
-      videoPathForBackend = "standing.webm";
+      videoPathForBackend = "vandalism.mp4"; // Backend expects just the filename if it's in the default video folder
     } else if (selectedSource === 'upload') {
       if (uploadedFile) {
         setMonitoringStatus('Uploading video file...');
         try {
           const formData = new FormData();
           formData.append('video', uploadedFile);
-          const uploadResponse = await axios.post("http://localhost:8000/upload_video", formData, {
+          
+          const uploadResponse = await axios.post("https://bd8b46660df3.ngrok-free.app/upload_video", formData, {
+
             headers: {
               'Content-Type': 'multipart/form-data'
             }
           });
-          videoPathForBackend = uploadResponse.data.server_video_path; 
+          videoPathForBackend = uploadResponse.data.filepath; // Get the path from the backend response
           setMonitoringStatus('Video uploaded. Starting analysis...');
         } catch (uploadError: any) {
           console.error("Error uploading file:", uploadError);
-          setErrorMessage(uploadError.response?.data?.message || "Failed to upload video file.");
+          setErrorMessage(uploadError.response?.data?.error || "Failed to upload video file.");
           setMonitoringStatus('Upload failed.');
           setIsMonitoring(false);
           return;
@@ -142,6 +138,10 @@ export default function App() {
         return;
       }
     }
+    // If you add a 'webcam' option later:
+    // else if (selectedSource === 'webcam') {
+    //   videoPathForBackend = "webcam";
+    // }
 
     try {
       await axios.post(endpoint, {
@@ -149,10 +149,10 @@ export default function App() {
         email_for_report: emailForReport,
       });
       setMonitoringStatus('Processing video stream...');
-      setVideoFeedKey(Date.now());
+      setVideoFeedKey(Date.now()); // Refresh video feed to ensure it starts
     } catch (error: any) {
       console.error("Error starting monitoring:", error);
-      setErrorMessage(error.response?.data?.message || "Failed to start monitoring. Check server connection.");
+      setErrorMessage(error.response?.data?.error || "Failed to start monitoring. Check server connection.");
       setMonitoringStatus('Monitoring failed.');
       setIsMonitoring(false);
     }
@@ -161,13 +161,16 @@ export default function App() {
   const handleStopMonitoring = async () => {
     try {
       setMonitoringStatus('Stopping monitoring...');
-      await axios.post("http://localhost:8000/stop");
+      
+      await axios.post("https://bd8b46660df3.ngrok-free.app/stop");
+
       setIsMonitoring(false);
       setMonitoringStatus('Monitoring stopped.');
-      setVideoFeedKey(Date.now());
+      setVideoFeedKey(Date.now()); // Refresh video feed to clear stream
+      // Do not reset results immediately here, keep them for review
     } catch (error: any) {
       console.error("Error stopping monitoring:", error);
-      setErrorMessage(error.response?.data?.message || "Failed to stop monitoring.");
+      setErrorMessage(error.response?.data?.error || "Failed to stop monitoring.");
       setMonitoringStatus('Failed to stop monitoring.');
     }
   };
@@ -240,8 +243,8 @@ export default function App() {
                   </label>
                   <div className="space-y-3">
                     {[
-                      { value: 'default', label: 'Default Video (standing.webm)', icon: Camera },
-                      { value: 'upload', label: 'Upload Video', icon: Upload }
+                      { value: 'default', label: 'Default Video (theft.mp4)', icon: Camera },
+                      { value: 'upload', label: 'Upload Video', icon: Upload } // Renamed for clarity
                     ].map(({ value, label, icon: Icon }) => (
                       <label key={value} className="group relative block">
                         <input
@@ -485,45 +488,42 @@ export default function App() {
                   </div>
                 </div>
 
-                {/* Video Display - CORRECTED LOGIC HERE */}
+                {/* Video Display */}
                 <div className="relative bg-gradient-to-br from-gray-900 to-black">
                   <div className="flex items-center justify-center h-[60vh] relative overflow-hidden">
-                    {/* Show local video preview ONLY when selected for upload AND not monitoring */}
-                    {selectedSource === 'upload' && videoPreviewUrl && !isMonitoring && (
+                    {selectedSource === 'upload' && videoPreviewUrl && (
+                      // Display local video preview if selected for upload
                       <video
                         src={videoPreviewUrl}
                         controls
                         className="w-full h-full object-contain transition-all duration-500 hover:scale-105"
                       />
                     )}
-                    {/* Show live video feed from backend when monitoring (for any source) */}
-                    {isMonitoring && (
+                    {selectedSource === 'default' && (
                       <img
-                        key={videoFeedKey}
-                        src={`http://localhost:8000/video_feed?${videoFeedKey}`}
-                        alt="Live Video Feed"
+                        
+                        src={`https://bd8b46660df3.ngrok-free.app/video_feed?${videoFeedKey}`} 
+
+                        alt="Default Video"
                         className="w-full h-full object-contain transition-all duration-500 hover:scale-105"
                       />
                     )}
-                    {/* Placeholder when no video is selected or monitoring is off for uploaded video */}
-                    {(!isMonitoring && selectedSource === 'upload' && !videoPreviewUrl) && (
-                      <div className="text-center text-gray-400 dark:text-gray-500">
-                        <div className="relative mb-6">
-                          <div className="absolute inset-0 bg-gradient-to-r from-blue-500/20 to-purple-600/20 rounded-full blur-xl"></div>
-                          <Upload className="relative w-16 h-16 mx-auto text-gray-300 dark:text-gray-600" />
-                        </div>
-                        <h4 className="text-xl font-semibold mb-2">Upload a Video to Begin</h4>
-                        <p className="text-sm">Select 'Upload Video' and choose a file to start.</p>
-                      </div>
-                    )}
-                    {(!isMonitoring && selectedSource === 'default') && (
+                    {!selectedSource && ( // This state is not reachable with current logic (default is always selected initially)
                       <div className="text-center text-gray-400 dark:text-gray-500">
                         <div className="relative mb-6">
                           <div className="absolute inset-0 bg-gradient-to-r from-blue-500/20 to-purple-600/20 rounded-full blur-xl"></div>
                           <Camera className="relative w-16 h-16 mx-auto text-gray-300 dark:text-gray-600" />
                         </div>
-                        <h4 className="text-xl font-semibold mb-2">Ready to Monitor Default Video</h4>
-                        <p className="text-sm">Click 'Start Monitoring' to begin analysis of the default video.</p>
+                        <h4 className="text-xl font-semibold mb-2">No Video Source Selected</h4>
+                        <p className="text-sm">Choose a video source from the control panel to begin monitoring</p>
+                      </div>
+                    )}
+
+                    {/* Monitoring Overlay */}
+                    {isMonitoring && (
+                      <div className="absolute top-4 left-4 bg-black/60 backdrop-blur-sm rounded-xl px-4 py-2 flex items-center space-x-2">
+                        <div className="w-3 h-3 bg-red-500 rounded-full animate-pulse"></div>
+                        <span className="text-white text-sm font-medium">ANALYZING</span>
                       </div>
                     )}
                   </div>
@@ -587,8 +587,8 @@ export default function App() {
                       <div className="absolute inset-0 bg-gradient-to-r from-emerald-500/10 to-blue-500/10 rounded-2xl blur opacity-0 group-hover:opacity-100 transition-opacity duration-300"></div>
                       <div className="relative bg-white/80 dark:bg-gray-800/80 backdrop-blur-sm p-6 rounded-2xl border border-gray-200/50 dark:border-gray-600/50 hover:shadow-lg transition-all duration-300">
                         <div className="flex items-center space-x-3 mb-4">
-                          <div className="p-2 bg-amber-100 dark:bg-amber-900/50 rounded-lg">
-                            <UserX className="w-5 h-5 text-amber-600 dark:text-amber-400" />
+                          <div className="p-2 bg-emerald-100 dark:bg-emerald-900/50 rounded-lg">
+                            <UserX className="w-5 h-5 text-emerald-600 dark:text-emerald-400" />
                           </div>
                           <h5 className="font-semibold text-gray-800 dark:text-gray-200">Posture Detection</h5>
                         </div>
